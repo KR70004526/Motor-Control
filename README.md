@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/b91181f7-128c-492f-94cc-8bd16f747714)# Motor-Control
+# Motor-Control
 
 - Arduino Circuit 
 ![image](https://github.com/user-attachments/assets/577bc446-f11d-46f6-a622-a54b8e6b0ee3)
