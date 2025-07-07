@@ -10,108 +10,73 @@
   START OF THE CODE
 *********************************************************************************************************/
 
-/* IMPORT LIBARAY*/
-#include <mcp_can.h>
+/* IMPORT LIBRARIES */
 #include <SPI.h>
+#include <mcp_can.h>
 
-/* SETUP FOR CAN COMMUNICATION */
-const int CS_PIN = 10; 
-byte EXT   = 0;
-byte LEN   = 8;
-unsigned long int CAN_ID = 1;
+/* CAN COMMUNICATION SETUP */
+byte EXT = 0;
+byte LEN = 8;
+const int CS_PIN     = 10;
+unsigned long CAN_ID = 1;
+// Init CAN Communication
 MCP_CAN CAN(CS_PIN);
 
-/* LIMIT VALUE OF AK70-10 MIT MODE */
+/* COMMUNICATION PARAMETER SETUP */
+const long SERIAL_BAUD = 115200;
+const long CAN_BAUD    = CAN_1000KBPS;
+unsigned long lastStateTime        = 0;
+const unsigned long STATE_INTERVAL = 100;
+
+/* MOTOR PARAMETER RANGE SETUP */
+// Position [rad]
 #define P_MIN   -12.5f
 #define P_MAX   12.5f
+// Velocity [rad/s]
 #define V_MIN   -50.0f
 #define V_MAX   50.0f
+// Kp (Spring Constant)
 #define KP_MIN  0.0f
 #define KP_MAX  500.0f
+// Kd (Damper Constant)
 #define KD_MIN  0.0f
 #define KD_MAX  5.0f
+// Torque [Nm]
 #define T_MIN   -25.0f
 #define T_MAX   25.0f
-// IF YOU WANT TO CHANGE THE VALUE FOR OTHER MOTOR, PLEASE CHECK "CubeMars Manual" 44 PAGE.
 
-/* VALUE FOR INPUT COMMAND FROM PYTHON */
-String cmd;
-
-/* VALUE FOR MOTOR INPUT & OUTPUT */
-// MOTOR INPUT
-float pos = 0.0f; 
-float vel = 0.0f; 
-float kp  = 0.0f; 
-float kd  = 0.0f; 
-float tor = 0.0f;
-
-// MOTOR OUTPUT
-float pos_out;
-float vel_out;
-float tor_out;
-
-float torInit = 0.0f;
-float zeroOffset = 0.0f;
+/* MOTOR INPUT & OUTPUT VALUE INIT */
+// Input Value
+float pos = 0.0; float vel = 0.0; float kp = 0.0; float kd = 0.0; float tor = 0.0;
+// Output Value
+float pos_out = 0.0; float vel_out = 0.0; float tor_out = 0.0;
 
 /*********************************************************************************************************
   MAIN SECTION
 *********************************************************************************************************/
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  while (CAN.begin(MCP_ANY, CAN_1000KBPS, MCP_16MHZ) != CAN_OK) {
-    delay(100);
+  Serial.begin(SERIAL_BAUD);
+  while (CAN.begin(MCP_ANY, CAN_BAUD, MCP_16MHZ) != CAN_OK) {
+    Serial.println("CANNOT CONNECT CAN COMMUNICATION");
   }
   CAN.setMode(MCP_NORMAL);
-  delay(1000); 
+  lastStateTime = millis();
 }
 
 void loop() {
-  char buf[100];
-  if (Serial.available() > 0) {
-    cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    cmd.toUpperCase();
-
-    if (cmd == "ON") {
-      EnterMotorMode(CAN_ID);
-      Serial.println("Motor Mode :: ON");
-      return;
-    }
-
-    if (cmd == "OFF") {
-      ExitMotorMode(CAN_ID);
-      Serial.println("Motor Mode :: OFF");
-      return;
-    }
-
-    if (cmd == "ORIGIN") {
-      ZeroMode(CAN_ID);
-      Serial.println("SET ORIGIN");
-      return;
-    }
-
-    if (cmd.startsWith("ID:")) {
-      int new_id = cmd.substring(3).toInt();
-      CAN_ID = new_id;
-      Serial.print("MOTOR ID :: "); Serial.println(CAN_ID);
-      return;
-    }
-
-    if (cmd.startsWith("SEND POS:")) {
-      pos = parseValue(cmd, "POS:");
-      vel = parseValue(cmd, "VEL:");
-      kp  = parseValue(cmd, "KP:");
-      kd  = parseValue(cmd, "KD:");
-      tor = parseValue(cmd, "TOR:");
-
-    }
+  unsigned long now = millis();
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    ProcessCMD(line);
   }
-  SendToMotor(CAN_ID, pos, vel, kp, kd, tor);
-  delay(10);
-  SendToArduino();   // TO GET OUTPUT VALUE FROM MOTOR IN REAL-TIME, MUST PUT THIS FUNCTION ON LOOP NOT SERIAL COMMUNICATION PART.
-  delay(100);
+
+  if (now - lastStateTime >= STATE_INTERVAL) {
+    if (ReadMotorState()) {
+      SendMotorState();
+    }
+    lastStateTime = now;
+  }
 }
 
 /*********************************************************************************************************
@@ -137,7 +102,7 @@ void ZeroMode(int mot_id) {
 }
 
 /*********************************************************************************************************
-  CAN COMMUNICATION SECTION
+  RECEIVE FROM HIGH-LEVEL CONTROLLER & SEND COMMAND TO MOTOR
 *********************************************************************************************************/
 
 // SEND POS, VEL, KP, KD, TOR TO MOTOR
@@ -147,40 +112,17 @@ void SendToMotor(int mot_id, float pos, float vel, float kp, float kd, float tor
   unsigned int con_vel = float_to_uint(constrain(vel, V_MIN, V_MAX), V_MIN, V_MAX, 12);
   unsigned int con_kp  = float_to_uint(constrain(kp,  KP_MIN, KP_MAX), KP_MIN, KP_MAX, 12);
   unsigned int con_kd  = float_to_uint(constrain(kd,  KD_MIN, KD_MAX), KD_MIN, KD_MAX, 12);
-  unsigned int con_torq= float_to_uint(constrain(torq,T_MIN, T_MAX), T_MIN, T_MAX, 12);
+  unsigned int con_tor = float_to_uint(constrain(torq,T_MIN, T_MAX), T_MIN, T_MAX, 12);
   data[0] = con_pos >> 8;
   data[1] = con_pos & 0xFF;
   data[2] = con_vel >> 4;
   data[3] = ((con_vel & 0xF) << 4) | (con_kp >> 8);
   data[4] = con_kp & 0xFF;
   data[5] = con_kd >> 4;
-  data[6] = ((con_kd & 0xF) << 4) | (con_torq >> 8);
-  data[7] = con_torq & 0xFF;
+  data[6] = ((con_kd & 0xF) << 4) | (con_tor >> 8);
+  data[7] = con_tor  & 0xFF;
   CAN.sendMsgBuf(mot_id, EXT, LEN, data);
 }
-
-// RECEIVE POS_OUT, VEL_OUT, TOR_OUT FROM MOTOR
-void SendToArduino() {
-  byte dat[8];
-  if (CAN.checkReceive() == CAN_MSGAVAIL) {
-    CAN.readMsgBuf(&CAN_ID, &EXT, &LEN, dat); 
-    pos_out = uint_to_float((dat[1] << 8) | dat[2], P_MIN, P_MAX, 16);
-    vel_out = uint_to_float((dat[3] << 4) | (dat[4] >> 4), V_MIN, V_MAX, 12);
-    tor_out = uint_to_float(((dat[4] & 0xF) << 8) | dat[5], T_MIN, T_MAX, 12);
-    Serial.print("Position: ");
-    Serial.print(pos_out);
-    Serial.print(", Velocity: ");
-    Serial.print(vel_out);
-    Serial.print(", Torque: ");
-    Serial.println(tor_out);
-  } else {
-    Serial.println("Cannot Receive from Motor...");
-  } 
-}
-
-/*********************************************************************************************************
-  RECEIVE COMMAND FROM PYTHON VIA SERIAL COMMUNICATION
-*********************************************************************************************************/
 
 float parseValue(String input, String key) {
   int startIndex = input.indexOf(key);
@@ -191,8 +133,58 @@ float parseValue(String input, String key) {
   return input.substring(colonIndex, commaIndex).toFloat();
 }
 
+void ProcessCMD(String cmd) {
+  cmd.trim(); cmd.toUpperCase();
+
+  if (cmd == "ON") {
+    EnterMotorMode(CAN_ID); return;
+  }
+  else if (cmd == "OFF") {
+    ExitMotorMode(CAN_ID); return;
+  }
+  else if (cmd == "ORIGIN") {
+    ZeroMode(CAN_ID); return;
+  }
+  else if (cmd.startsWith("ID:")) {
+    int new_id = cmd.substring(3).toInt();
+    CAN_ID = new_id; return;
+  } 
+  else if (cmd.startsWith("SEND POS:")) {
+      pos = parseValue(cmd, "POS:");
+      vel = parseValue(cmd, "VEL:");
+      kp  = parseValue(cmd, "KP:");
+      kd  = parseValue(cmd, "KD:");
+      tor = parseValue(cmd, "TOR:");
+      SendToMotor(CAN_ID, pos, vel, kp, kd, tor);
+      return;
+  }
+}
+
 /*********************************************************************************************************
-  CONVERSION SECTION
+  RECEIVE MOTOR STATE & SEND TO HIGH-LEVEL CONTROLLER
+*********************************************************************************************************/
+
+// RECEIVE POS_OUT, VEL_OUT, TOR_OUT FROM MOTOR
+bool ReadMotorState() {
+  unsigned long recvID;
+  byte ext, len;
+  byte dat[8];
+  if (CAN.checkReceive() != CAN_MSGAVAIL) return false;
+  CAN.readMsgBuf(&recvID, &ext, &len, dat); 
+  pos_out = uint_to_float((dat[1] << 8) | dat[2], P_MIN, P_MAX, 16);
+  vel_out = uint_to_float((dat[3] << 4) | (dat[4] >> 4), V_MIN, V_MAX, 12);
+  tor_out = uint_to_float(((dat[4] & 0xF) << 8) | dat[5], T_MIN, T_MAX, 12);
+  return true;
+}
+
+void SendMotorState() {
+  Serial.print("POS:"); Serial.print(pos_out, 4);
+  Serial.print(", VEL:"); Serial.print(vel_out, 4);
+  Serial.print(", TOR:"); Serial.println(tor_out, 4);
+}
+
+/*********************************************************************************************************
+  INT <--> FLOAT CONVERSION SECTION
 *********************************************************************************************************/
 
 // CONVERT FLOAT TO UNSIGNED INT
