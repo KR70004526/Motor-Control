@@ -14,7 +14,7 @@ class SerialReaderThread(QtCore.QThread):
             if self.serial and self.serial.in_waiting:
                 try:
                     line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if line.startswith("Position:"):
+                    if line.startswith("POS:"):
                         parsed = self.parser.parse_line(line)
                         if parsed:
                             self.status_received.emit(parsed)
