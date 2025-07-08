@@ -1,4 +1,5 @@
 import sys
+import math
 from PyQt5.QtWidgets import QMessageBox
 from PyQt5 import QtCore, QtWidgets
 from Manual_Dialog import Ui_Dialog
@@ -38,8 +39,10 @@ class Main:
         self.ui.emergencyButton.clicked.connect(self.send_emergency_stop)       
 
         self.SCALE      = 100
-        P_MIN, P_MAX    = -12.5, 12.5
-        V_MIN, V_MAX    = -50.0, 50.0
+        self.deg2rad = math.pi / 180
+        self.rad2deg = 180 / math.pi
+        P_MIN, P_MAX    = -12.5*self.rad2deg, 12.5*self.rad2deg
+        V_MIN, V_MAX    = -50.0*self.rad2deg, 50.0*self.rad2deg
         KP_MIN, KP_MAX  = 0.0, 500.0
         KD_MIN, KD_MAX  = 0.0, 5.0
         T_MIN, T_MAX    = -25.0, 25.0
@@ -160,7 +163,10 @@ class Main:
         kd  = self.ui.kdBox.value()
         tor = self.ui.torBox.value()
 
-        success, msg = self.parameter_manager.send_parameters(pos, vel, kp, kd, tor)
+        pos_rad = pos * self.deg2rad
+        vel_rad = vel * self.deg2rad
+
+        success, msg = self.parameter_manager.send_parameters(pos_rad, vel_rad, kp, kd, tor)
         if not suppress_msg:
             self.show_message(success, msg)
         return success, msg
@@ -181,8 +187,14 @@ class Main:
         )
 
     def update_output_labels(self, parsed):
-        self.ui.posOutValue.setText(parsed["pos"])
-        self.ui.velOutValue.setText(parsed["vel"])
+        pos_rad = float(parsed["pos"])
+        vel_rad = float(parsed["vel"])
+
+        pos_deg = pos_rad * self.rad2deg
+        vel_deg = vel_rad * self.rad2deg
+
+        self.ui.posOutValue.setText(f"{pos_deg:.2f}")
+        self.ui.velOutValue.setText(f"{vel_deg:.2f}")
         self.ui.torOutValue.setText(parsed["tor"])
 
     def run(self):
