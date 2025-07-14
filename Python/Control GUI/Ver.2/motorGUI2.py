@@ -411,13 +411,13 @@ class Ui_MotorGUI2(object):
         self.cmdButton.setText(_translate("MotorGUI2", "SEND"))
         self.torqueLabel.setText(_translate("MotorGUI2", "Torque [Nm]"))
         self.positionLabel.setText(_translate("MotorGUI2", "Position [rad]"))
-        self.velocityLabel.setText(_translate("MotorGUI2", "Velocity [rad/s]"))
+        self.velocityLabel.setText(_translate("MotorGUI2", "Velocity [rpm]"))
         self.originButton.setText(_translate("MotorGUI2", "ORIGIN"))
         self.kdLabel.setText(_translate("MotorGUI2", "Kd"))
         self.emergencyButton.setText(_translate("MotorGUI2", "EMERGENCY STOP"))
         self.kpLabel.setText(_translate("MotorGUI2", "Kp"))
         self.posOutLabel.setText(_translate("MotorGUI2", "Position [rad]"))
-        self.velOutLabel.setText(_translate("MotorGUI2", "Velocity [rad/s]"))
+        self.velOutLabel.setText(_translate("MotorGUI2", "Velocity [rpm]"))
         self.torOutLabel.setText(_translate("MotorGUI2", "Torque [Nm]"))
 
 
