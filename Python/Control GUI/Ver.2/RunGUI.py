@@ -41,8 +41,10 @@ class Main:
         self.SCALE      = 100
         self.deg2rad = math.pi / 180
         self.rad2deg = 180 / math.pi
+        self.rad2rpm = 60 / (2 * math.pi)
+        self.rpm2rad = (2 * math.pi) / 60
         P_MIN, P_MAX    = -12.5*self.rad2deg, 12.5*self.rad2deg
-        V_MIN, V_MAX    = -50.0*self.rad2deg, 50.0*self.rad2deg
+        V_MIN, V_MAX    = -50.0*self.rad2rpm, 50.0*self.rad2rpm
         KP_MIN, KP_MAX  = 0.0, 500.0
         KD_MIN, KD_MAX  = 0.0, 5.0
         T_MIN, T_MAX    = -25.0, 25.0
@@ -164,7 +166,7 @@ class Main:
         tor = self.ui.torBox.value()
 
         pos_rad = pos * self.deg2rad
-        vel_rad = vel * self.deg2rad
+        vel_rad = vel * self.rpm2rad
 
         success, msg = self.parameter_manager.send_parameters(pos_rad, vel_rad, kp, kd, tor)
         if not suppress_msg:
@@ -191,7 +193,7 @@ class Main:
         vel_rad = float(parsed["vel"])
 
         pos_deg = pos_rad * self.rad2deg
-        vel_deg = vel_rad * self.rad2deg
+        vel_deg = vel_rad * self.rad2rpm
 
         self.ui.posOutValue.setText(f"{pos_deg:.2f}")
         self.ui.velOutValue.setText(f"{vel_deg:.2f}")
