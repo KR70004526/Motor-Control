@@ -480,11 +480,113 @@ class MotorBase:
 # Console helpers
 # =========================
 HELP_TEXT = """
-명령:
-  ids 1,2,4 | id 4 | on [all]|off [all]|origin [all]
+[AK70-10 MIT Console 명령 요약]
+
+기본 흐름:
+  1) ids <1,2,..>     ─ 제어할 모터 ID 등록
+  2) id <n>           ─ 현재 대상 ID 선택
+  3) on / update ...  ─ 구동 및 파라미터 갱신
+  4) start [제목]     ─ 로깅 시작(csv/json)
+  5) end              ─ 로깅 종료 (CSV/TXT 모두)
+  6) stop [all|<id>]  ─ 파라미터 0 + origin(안전정지)
+  7) close            ─ 팝업 종료 + 연결 정리
+
+명령(요약):
+  ids [id index]            ID 목록 등록(수신/송신 대상)
+  id <n>                    현재 대상 ID 설정
+  on [all|<id>]             모터 MIT모드 진입(개별/전체)
+  off [all|<id>]            모터 모드 종료(개별/전체)
+  origin [all|<id>]         원점 설정(개별/전체)
   update [id=<n>] pos=.. vel=.. kp=.. kd=.. tor=..
-  get <id> | show | start [제목] [csv|json] | end | stop [all|<id>] | help | close
+                            파라미터 갱신(미지정 값은 직전값 유지)
+  get <id>                  현재 상태(최근 수신 pos/vel/tor) 조회
+  show                      수신 중인 모든 ID의 최근 상태 출력
+  start [제목] [csv|json]
+                            세션 시작(팝업 자동; CSV는 host_iso,mcu_ms_abs 기록)
+  end                       세션 종료(모든 파일 flush/close)
+  stop [all|<id>]           안전정지: pos/vel/kp/kd/tor=0 + origin
+  help [명령]               도움말(명령별 상세는 'help update' 등)
+  close                     팝업 종료 후 포트/스레드 정리
+
+예시:
+  ids 1,2
+  id 1
+  on
+  update pos=0.5 vel=0.0 kp=20 kd=0.5 tor=0.0
+  start 테스트런 csv
+  get 1
+  stop 1
+  end
+  close
 """
+
+HELP_DETAIL = {
+  "ids": """
+사용법:  ids [id index]
+설명  :  제어/로깅 대상 모터 ID 목록을 등록합니다. 세션 중간에 새 ID가 들어오면 CSV 열이 뒤에 추가될 수 있으니,
+         가능하면 start 전에 ids로 고정하세요.
+예시  :  ids 1,2
+주의  :  잘못된 토큰은 무시됩니다.
+""",
+  "id": """
+사용법:  id <n>
+설명  :  현재 대상 ID를 설정합니다. on/off/update 등 단일 명령의 기본 대상이 됩니다.
+예시  :  id 2
+""",
+  "on": """
+사용법:  on [all|<id>] 
+설명  :  MIT 모드 진입(개별/전체). 'on all'은 등록된 모든 ID에 적용.
+예시  :  on / on all
+""",
+  "off": """
+사용법:  off [all|<id>] 
+설명  :  모드 종료(개별/전체). 토크/속도 명령이 멈춥니다.
+예시  :  off / off all
+""",
+  "origin": """
+사용법:  origin [all|<id>] 
+설명  :  원점(제로) 설정. 제어 충돌 방지를 위해 모드 전환 전후에 유용합니다.
+예시  :  origin / origin all
+""",
+  "update": """
+사용법:  update [id=<n>] pos=<r> vel=<r> kp=<r> kd=<r> tor=<r>
+설명  :  파라미터 갱신. 미지정 값은 직전 값 유지(부분 갱신 허용).
+         제한: pos[{-12.5..12.5}], vel[{-50..50}], kp[0..500], kd[0..5], tor[{-25..25}]
+예시  :  update id=1 pos=0.5 kp=30 kd=0.4
+         update 2 vel=0.0 tor=0.0      (숫자만 쓰면 id=<n>으로 해석)
+오류  :  범위를 벗어나면 ValueError를 발생시켜 전송하지 않습니다.
+""",
+  "get": """
+사용법:  get <id>
+설명  :  해당 ID의 최근 수신 상태(pos/vel/tor)를 보여줍니다.
+예시  :  get 1
+""",
+  "show": """
+사용법:  show
+설명  :  수신된 모든 ID의 최근 상태를 한 번에 표시합니다.
+""",
+  "start": """
+사용법:  start [제목] [csv|json]
+설명  :  세션 시작. logs/YYYY-MM-DD/제목/ 아래에 Log_*.txt와 data_*.csv|jsonl 생성,
+         PowerShell 팝업 자동(tail -f). CSV에는 host_iso, mcu_ms_abs 메타와 id별 pos/vel/tor 기록.
+예시  :  start 런1 csv
+주의  :  시작 직후 첫 프레임이 들어와야 CSV 첫 줄이 생깁니다.
+""",
+  "end": """
+사용법:  end
+설명  :  세션 종료(텍스트 로그 중단 → 레코더 분리 → 큐 flush/close → END 마커 기록).
+         시작/종료 시각은 'commands.log'와 CSV host_iso로 확인 가능.
+""",
+  "stop": """
+사용법:  stop [all|<id>]
+설명  :  안전정지. pos/vel/kp/kd/tor=0으로 만들고 origin(개별 또는 전체)을 수행합니다.
+예시  :  stop 1 / stop all
+""",
+  "close": """
+사용법:  close
+설명  :  (세션이 열려 있으면 end 수행 후) 모든 팝업 종료, 스레드/포트 정리, 프로그램 종료.
+"""
+}
 
 def list_available_ports():
     try:
@@ -635,7 +737,16 @@ def run_console():
         lo = line.lower(); tokens = lo.split(); cmd = tokens[0]
         try:
             if cmd=='help':
-                print(HELP_TEXT)
+                if len(tokens) >= 2:
+                    topic = tokens[1].lower()
+                    text = HELP_DETAIL.get(topic)
+                    if text:
+                        print(text.strip())
+                    else:
+                        print("알 수 없는 명령. 기본 도움말을 표시합니다.\n")
+                        print(HELP_TEXT)
+                else:
+                    print(HELP_TEXT)
 
             elif cmd=='ids':
                 arg = line.partition(' ')[2].strip().replace(' ','')
