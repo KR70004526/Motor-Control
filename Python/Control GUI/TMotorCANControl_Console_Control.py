@@ -1,20 +1,13 @@
-# Launcher.py
+# Launcher.py  (Precision-first: main-thread control loop, console in thread)
 # =============================================================================
 # RPi4 + Ubuntu + Seengreat 2CH CAN HAT (SocketCAN: can0)
-# TMotorCANControl (MIT mode) multi-motor console + logger
-# -----------------------------------------------------------------------------
-# Features
-# - Multi-motor control over CAN (MIT mode)
-# - Console: ids / id / on / off / origin / update / get / show / start / stop / end / close
-# - CSV logging: host_ms, loop_ms, motor_id, pos, vel, tau(Nm), iq(A), temp(C), err
-# - Safe sequence: power_on/off if available, zero with 0-torque, torque clamp by MIT_Params
-# - Gains once; update pos/vel/torque each loop
+# TMotorCANControl (MIT mode) - main thread realtime control + console thread
 # -----------------------------------------------------------------------------
 # Prereqs:
 #   sudo ip link set can0 up type can bitrate 1000000
-#   pip install TMotorCANControl NeuroLocoMiddleware
+#   python3 -m pip install TMotorCANControl NeuroLocoMiddleware
 # Run:
-#   python Launcher.py
+#   python3 Launcher.py
 # =============================================================================
 
 import os
@@ -22,24 +15,47 @@ import csv
 import time
 import shlex
 import signal
+import queue
 import threading
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 
-from NeuroLocoMiddleware.SoftRealtimeLoop import SoftRealtimeLoop
-from TMotorCANControl.mit_can import TMotorManager_mit_can
+# --- Precise realtime loop (must be used from main thread) ---
+try:
+    from NeuroLocoMiddleware.SoftRealtimeLoop import SoftRealtimeLoop
+except Exception as e:
+    print(f"[WARN] NeuroLocoMiddleware not available ({e}). "
+          f"Falling back to a simple loop (precision reduced).")
+    class SoftRealtimeLoop:
+        def __init__(self, dt: float, report: bool = False, fade: float = 0.0):
+            assert dt > 0.0
+            self.dt = dt
+        def __iter__(self):
+            t0 = time.perf_counter()
+            n  = 0
+            while True:
+                yield time.perf_counter() - t0
+                n += 1
+                target = t0 + n * self.dt
+                while True:
+                    now = time.perf_counter()
+                    if now >= target:
+                        break
+                    time.sleep(min(0.001, max(0.0, target - now)))
 
-# Pull model params (limits, torque constants) from library
+# --- TMotor MIT CAN manager & params (GitHub: TMotorCANControl.mit_can) ---
+from TMotorCANControl.mit_can import TMotorManager_mit_can
 try:
     from TMotorCANControl.mit_can import MIT_Params
 except Exception:
     MIT_Params = {
+        # Conservative defaults for AK70-10 (edit if needed)
         "AK70-10": {
             "P_min": -12.5, "P_max": 12.5,
             "V_min": -50.0, "V_max": 50.0,
             "T_min": -25.0, "T_max": 25.0,
-            "Kp_min": 0.0, "Kp_max": 500.0,
-            "Kd_min": 0.0, "Kd_max": 5.0,
+            "Kp_min": 0.0,  "Kp_max": 500.0,
+            "Kd_min": 0.0,  "Kd_max": 5.0,
         }
     }
 
@@ -57,8 +73,8 @@ def now_ms() -> int:
 class MotorState:
     pos: float = 0.0   # rad
     vel: float = 0.0   # rad/s
-    tau: float = 0.0   # Nm  (output torque)
-    iq:  float = 0.0   # A   (q-axis current)
+    tau: float = 0.0   # Nm
+    iq:  float = 0.0   # A
     temp: float = 0.0  # °C
     err: int = 0       # driver error code
 
@@ -83,7 +99,8 @@ class CSVRecorder:
             self._fh = open(path, "w", newline="")
             self._csv = csv.writer(self._fh)
             self._csv.writerow(
-                ["host_ms", "loop_ms", "motor_id", "pos_rad", "vel_rad_s", "tau_Nm", "iq_A", "temp_C", "err"]
+                ["host_ms", "loop_ms", "motor_id", "pos_rad", "vel_rad_s",
+                 "tau_Nm", "iq_A", "temp_C", "err"]
             )
             self._path = path
             self._running = True
@@ -93,16 +110,14 @@ class CSVRecorder:
         with self._lock:
             self._running = False
             if self._fh:
-                try:
-                    self._fh.flush()
-                except Exception:
-                    pass
+                try: self._fh.flush()
+                except Exception: pass
                 self._fh.close()
             self._fh = None
             self._csv = None
             self._path = None
 
-    def write_frame(self, loop_ms: int, states: Dict[int, MotorState]):
+    def write_states(self, loop_ms: int, states: Dict[int, MotorState]):
         with self._lock:
             if not self._running or not self._csv:
                 return
@@ -139,7 +154,7 @@ class LogControlManager:
             for mid, st in states.items():
                 self._states[mid] = st
         if self._recording:
-            self._rec.write_frame(loop_ms, states)
+            self._rec.write_states(loop_ms, states)
 
     def get_state(self, motor_id: int) -> MotorState:
         with self._lock:
@@ -154,11 +169,10 @@ class LogControlManager:
         return self._rec.path
 
 # =============================================================================
-# TMotor device & pool (MIT mode)
+# TMotor device (MIT mode)
 # =============================================================================
 
 class TMotorDevice:
-    """One physical actuator (MIT mode)."""
     def __init__(self, motor_type: str, motor_id: int,
                  pos_lim: Tuple[float, float], vel_lim: Tuple[float, float], tau_lim: Tuple[float, float]):
         self.motor_type = motor_type
@@ -169,7 +183,6 @@ class TMotorDevice:
 
         self.dev = TMotorManager_mit_can(motor_type=motor_type, motor_ID=motor_id)
 
-        # Runtime flags
         self.ctx_opened = False
         self.enabled = False
 
@@ -178,48 +191,94 @@ class TMotorDevice:
         self.kd = 0.0
         self.pos = 0.0
         self.vel = 0.0
-        self.tau = 0.0   # Nm (we command torque; lib converts to current)
+        self.tau = 0.0   # Nm
+
+    # --- torque API wrappers (version-safe) ---
+    def _set_tau_nm(self, tau: float):
+        if hasattr(self.dev, "set_output_torque_newton_meters"):
+            return self.dev.set_output_torque_newton_meters(tau)
+        if hasattr(self.dev, "set_motor_torque_newton_meters"):
+            return self.dev.set_motor_torque_newton_meters(tau)
+        # fallback via current if converter exists
+        try:
+            if hasattr(self.dev, "torque_to_qaxis_current_amps"):
+                iq = self.dev.torque_to_qaxis_current_amps(tau)
+                return self.dev.set_motor_current_qaxis_amps(iq)
+        except Exception:
+            pass
+        # last resort: zero current for safety
+        try:
+            return self.dev.set_motor_current_qaxis_amps(0.0)
+        except Exception:
+            return None
+
+    def _get_tau_nm(self) -> float:
+        if hasattr(self.dev, "get_output_torque_newton_meters"):
+            return self.dev.get_output_torque_newton_meters()
+        try:
+            iq = self.dev.get_current_qaxis_amps()
+            if hasattr(self.dev, "qaxis_current_amps_to_torque"):
+                return self.dev.qaxis_current_amps_to_torque(iq)
+        except Exception:
+            pass
+        return 0.0
 
     # ----- Lifecycle -----
     def on(self):
         if not self.ctx_opened:
-            self.dev.__enter__()   # open CAN + init internal state
+            self.dev.__enter__()           # open CAN, prepare
             self.ctx_opened = True
-        # (optional but preferred) power_on if available
+
+        # power_on if available
         if hasattr(self.dev, "power_on"):
-            try:
-                self.dev.power_on()
-            except Exception:
-                pass
-        # quick connection sanity check
+            try: self.dev.power_on()
+            except Exception: pass
+
+        # connection sanity check
         try:
             ok = self.dev.check_can_connection()
             if not ok:
                 print(f"[WARN] motor {self.motor_id}: CAN ping failed")
         except Exception:
             pass
+
+        # hold current angle to avoid jump
+        try:
+            self.pos = self.dev.get_output_angle_radians()
+        except Exception:
+            pass
+        try:
+            self.dev.set_output_angle_radians(self.pos)
+            self.dev.set_output_velocity_radians_per_second(0.0)
+            self._set_tau_nm(0.0)
+            self.dev.update()
+        except Exception:
+            pass
+
+        # re-apply gains if already set
+        if (self.kp != 0.0) or (self.kd != 0.0):
+            try:
+                self.dev.set_impedance_gains_real_unit(K=self.kp, B=self.kd)
+            except Exception:
+                pass
+
         self.enabled = True
 
     def off(self):
         if self.enabled:
-            # send a safe zero command first
+            # safe zero frame before power-off
             try:
                 self.dev.set_output_velocity_radians_per_second(0.0)
-                self.dev.set_output_torque_newton_meters(0.0)
+                self._set_tau_nm(0.0)
                 self.dev.update()
             except Exception:
                 pass
-            # power_off or exit motor mode
             if hasattr(self.dev, "power_off"):
-                try:
-                    self.dev.power_off()
-                except Exception:
-                    pass
+                try: self.dev.power_off()
+                except Exception: pass
             elif hasattr(self.dev, "exit_motor_mode"):
-                try:
-                    self.dev.exit_motor_mode()
-                except Exception:
-                    pass
+                try: self.dev.exit_motor_mode()
+                except Exception: pass
         self.enabled = False
 
     def close(self):
@@ -237,7 +296,7 @@ class TMotorDevice:
         # zero with safe stop
         try:
             self.dev.set_output_velocity_radians_per_second(0.0)
-            self.dev.set_output_torque_newton_meters(0.0)
+            self._set_tau_nm(0.0)
             self.dev.update()
         except Exception:
             pass
@@ -253,39 +312,44 @@ class TMotorDevice:
             self.pos = clamp(pos, *self.pos_lim)
         if vel is not None:
             self.vel = clamp(vel, *self.vel_lim)
-        if tor is not None:  # torque in Newton-meters
+        if tor is not None:  # Nm
             self.tau = clamp(tor, *self.tau_lim)
 
     def step(self):
-        # send cached command; gains are applied when updated
+        # send cached command; gains applied when updated
         self.dev.set_output_angle_radians(self.pos)
         self.dev.set_output_velocity_radians_per_second(self.vel)
-        self.dev.set_output_torque_newton_meters(self.tau)
+        self._set_tau_nm(self.tau)
         self.dev.update()
 
     def read_state(self) -> MotorState:
         try:
             p   = self.dev.get_output_angle_radians()
             v   = self.dev.get_output_velocity_radians_per_second()
-            tau = self.dev.get_output_torque_newton_meters()
+            tau = self._get_tau_nm()
             iq  = self.dev.get_current_qaxis_amps()
-            tC  = self.dev.get_temperature_celsius()
-            err = self.dev.get_motor_error_code()
+            try:
+                tC = self.dev.get_temperature_celsius()
+            except Exception:
+                tC = getattr(self.dev, "temperature", 0.0)
+            try:
+                err = self.dev.get_motor_error_code()
+            except Exception:
+                err = getattr(self.dev, "error", 0)
             return MotorState(p, v, tau, iq, tC, err)
         except Exception:
-            # fall back to last command if read failed
             return MotorState(self.pos, self.vel, self.tau, 0.0, 0.0, 0)
 
+# =============================================================================
+# TMotorPool (no worker thread; stepped by main loop)
+# =============================================================================
+
 class TMotorPool:
-    def __init__(self, rx: LogControlManager, motor_type: str = "AK70-10", dt: float = 0.005):
+    def __init__(self, rx: LogControlManager, motor_type: str = "AK70-10"):
         self.rx = rx
         self.motor_type = motor_type
-        self.dt = dt
         self.devs: Dict[int, TMotorDevice] = {}
-        self.running = threading.Event()
-        self.th = threading.Thread(target=self._loop, daemon=True)
 
-        # limits from MIT_Params (per model)
         mp = MIT_Params.get(motor_type, MIT_Params.get("AK70-10"))
         self.pos_lim = (float(mp["P_min"]), float(mp["P_max"]))
         self.vel_lim = (float(mp["V_min"]), float(mp["V_max"]))
@@ -304,18 +368,7 @@ class TMotorPool:
             d.close()
         self.devs.clear()
 
-    def start(self):
-        self.running.set()
-        if not self.th.is_alive():
-            self.th.start()
-
-    def stop(self):
-        self.running.clear()
-        if self.th.is_alive():
-            self.th.join(timeout=1.0)
-        self.remove_all()
-
-    # proxies for high-level
+    # proxies
     def on(self, motor_id: int):     self.devs[motor_id].on()
     def off(self, motor_id: int):    self.devs[motor_id].off()
     def origin(self, motor_id: int): self.devs[motor_id].origin()
@@ -331,29 +384,21 @@ class TMotorPool:
     def get_state(self, motor_id: int) -> MotorState:
         return self.devs[motor_id].read_state()
 
-    # realtime loop
-    def _loop(self):
-        loop = SoftRealtimeLoop(dt=self.dt, report=False, fade=0.0)
-        t0 = time.monotonic()
-        for _ in loop:
-            if not self.running.is_set():
-                break
-            loop_ms = int((time.monotonic() - t0) * 1000)
-            states: Dict[int, MotorState] = {}
-            for mid, dev in self.devs.items():
-                if not dev.enabled:
-                    continue
-                try:
-                    dev.step()                  # tx/rx
-                    states[mid] = dev.read_state()
-                except Exception:
-                    # keep going on bus hiccup
-                    pass
-            if states:
-                self.rx.ingest_states(loop_ms, states)
+    def step_once(self) -> Dict[int, MotorState]:
+        """Call per SoftRealtimeLoop tick (main thread)."""
+        states: Dict[int, MotorState] = {}
+        for mid, dev in self.devs.items():
+            if not dev.enabled:
+                continue
+            try:
+                dev.step()
+                states[mid] = dev.read_state()
+            except Exception:
+                pass
+        return states
 
 # =============================================================================
-# High-level Motor wrapper & console
+# High-level wrapper
 # =============================================================================
 
 class MotorBase:
@@ -363,18 +408,17 @@ class MotorBase:
     _last_cmds: Dict[int, Dict[str, float]] = {}
 
     @classmethod
-    def connect(cls, motor_type: str = "AK70-10", dt: float = 0.005):
+    def connect(cls, motor_type: str = "AK70-10"):
         if cls._connected:
             return
         cls._rx = LogControlManager()
-        cls._pool = TMotorPool(rx=cls._rx, motor_type=motor_type, dt=dt)
-        cls._pool.start()
+        cls._pool = TMotorPool(rx=cls._rx, motor_type=motor_type)
         cls._connected = True
 
     @classmethod
     def close_all(cls):
         if cls._pool:
-            cls._pool.stop()
+            cls._pool.remove_all()
         cls._pool = None
         cls._rx = None
         cls._connected = False
@@ -398,7 +442,6 @@ class MotorBase:
         if kp  is not None: cache["kp"]  = float(kp)
         if kd  is not None: cache["kd"]  = float(kd)
         if tor is not None: cache["tor"] = float(tor)   # Nm
-
         if (kp is not None) or (kd is not None):
             MotorBase._pool.set_gains(self.id, cache["kp"], cache["kd"])
         MotorBase._pool.set_command(self.id, pos=cache["pos"], vel=cache["vel"], tor=cache["tor"])
@@ -411,7 +454,7 @@ class MotorBase:
         return cls._rx
 
 # =============================================================================
-# Console helpers
+# Console helpers (background thread → command queue)
 # =============================================================================
 
 HELP_TEXT = """
@@ -419,7 +462,7 @@ Commands:
   help
   ids <a,b,c>        : register motor ids
   id <n>             : select current id
-  on / off / origin  : motor power on/off (mode) and set zero (safe)
+  on / off / origin  : power on/off (mode) and set zero (safe)
   update k=v ...     : set any of pos, vel, kp, kd, tor (Nm)
                        e.g., update pos=0.3 vel=0 kp=30 kd=0.8 tor=1.5
   get [id]           : print state of id (default: current id)
@@ -430,11 +473,11 @@ Commands:
 """
 
 def header_ui(interface="can0", bitrate=1_000_000, log_path=None):
-    print("=" * 72)
-    print(" TMotor MIT CAN Console")
+    print("=" * 74)
+    print(" TMotor MIT CAN Console (Precision mode: main-thread control)")
     print(f" Interface : {interface} @ {bitrate}")
     print(f" Logging   : {log_path or '-'}")
-    print("=" * 72)
+    print("=" * 74)
 
 def parse_update_args(arg_str: str) -> Dict[str, float]:
     out = {}
@@ -448,152 +491,173 @@ def parse_update_args(arg_str: str) -> Dict[str, float]:
                 pass
     return out
 
-def run_console():
-    MOTOR_TYPE = "AK70-10"
-    DT = 0.005  # 200 Hz
+# Global command queue
+cmd_q: "queue.Queue[Tuple[str,str]]" = queue.Queue()
 
-    MotorBase.connect(motor_type=MOTOR_TYPE, dt=DT)
-    header_ui("can0", 1_000_000, MotorBase.rx().log_path)
-
-    motors: Dict[int, MotorBase] = {}
-    current_id: Optional[int] = None
-
+def console_thread():
     print("연결 완료. 'help'로 명령을 확인하세요.\n")
     while True:
         try:
             line = input(">> ").strip()
         except (EOFError, KeyboardInterrupt):
             line = "close"
-
         if not line:
             continue
-
         cmd, *rest = line.split(maxsplit=1)
-        cmd = cmd.lower()
         arg = rest[0] if rest else ""
-
-        if cmd in ("help", "?"):
-            print(HELP_TEXT)
-
-        elif cmd == "ids":
-            try:
-                raw = arg.replace(",", " ").split()
-                for tok in raw:
-                    mid = int(tok)
-                    if mid not in motors:
-                        motors[mid] = MotorBase(mid)
-                if raw:
-                    current_id = int(raw[0])
-                print(f"등록된 모터: {sorted(motors.keys())}, current id = {current_id}")
-            except Exception:
-                print("형식: ids 1,2,3")
-
-        elif cmd == "id":
-            try:
-                n = int(arg.strip())
-                if n not in motors:
-                    motors[n] = MotorBase(n)
-                current_id = n
-                print(f"current id = {current_id}")
-            except Exception:
-                print("형식: id 1")
-
-        elif cmd == "on":
-            if current_id is None:
-                print("먼저 id를 선택하세요.")
-                continue
-            motors[current_id].on()
-            print(f"[{current_id}] ON")
-
-        elif cmd == "off":
-            if current_id is None:
-                print("먼저 id를 선택하세요.")
-                continue
-            motors[current_id].off()
-            print(f"[{current_id}] OFF")
-
-        elif cmd == "origin":
-            if current_id is None:
-                print("먼저 id를 선택하세요.")
-                continue
-            motors[current_id].origin()
-            print(f"[{current_id}] ORIGIN done")
-
-        elif cmd == "update":
-            if current_id is None:
-                print("먼저 id를 선택하세요.")
-                continue
-            kv = parse_update_args(arg)
-            motors[current_id].update_parameters(
-                pos=kv.get("pos"), vel=kv.get("vel"),
-                kp=kv.get("kp"), kd=kv.get("kd"), tor=kv.get("tor"))
-            print(f"[{current_id}] updated {kv}")
-
-        elif cmd == "get":
-            target = current_id
-            if arg.strip():
-                try:
-                    target = int(arg.strip())
-                except Exception:
-                    pass
-            if target is None:
-                print("먼저 id를 선택하세요.")
-                continue
-            st = motors[target].get_parameters()
-            print(
-                f"[{target}] pos={st.pos:+.4f} rad  vel={st.vel:+.3f} rad/s  "
-                f"tau={st.tau:+.3f} Nm  iq={st.iq:+.3f} A  T={st.temp:.1f}°C  err={st.err}"
-            )
-
-        elif cmd == "show":
-            states = MotorBase.rx().get_all_states()
-            if not states:
-                print("상태 없음")
-            for mid in sorted(states.keys()):
-                st = states[mid]
-                print(
-                    f"[{mid}] pos={st.pos:+.4f} rad  vel={st.vel:+.3f} rad/s  "
-                    f"tau={st.tau:+.3f} Nm  iq={st.iq:+.3f} A  T={st.temp:.1f}°C  err={st.err}"
-                )
-
-        elif cmd == "start":
-            label = arg.strip() or "run"
-            path = MotorBase.rx().start_record(label)
-            print(f"CSV logging → {path}")
-
-        elif cmd in ("stop", "end"):
-            MotorBase.rx().stop_record()
-            print("logging stopped")
-
-        elif cmd == "close":
-            print("모터 종료 및 종료 중...")
-            for _, m in motors.items():
-                try:
-                    m.off()
-                except Exception:
-                    pass
-            MotorBase.close_all()
-            print("bye.")
+        cmd_q.put((cmd.lower(), arg))
+        if cmd.lower() == "close":
             break
 
-        else:
-            print("알 수 없는 명령입니다. 'help'를 입력하세요.")
+# =============================================================================
+# Main (precision-first): main-thread realtime loop + console thread
+# =============================================================================
+
+def run_main_precision():
+    MOTOR_TYPE = "AK70-10"
+    DT = 0.005  # 200 Hz
+
+    MotorBase.connect(motor_type=MOTOR_TYPE)
+    header_ui("can0", 1_000_000, MotorBase.rx().log_path)
+
+    motors: Dict[int, MotorBase] = {}
+    current_id: Optional[int] = None
+
+    th = threading.Thread(target=console_thread, daemon=True, name="ConsoleThread")
+    th.start()
+
+    loop = SoftRealtimeLoop(dt=DT, report=False, fade=0.0)
+    t0 = time.monotonic()
+    running = True
+
+    try:
+        for _ in loop:
+            # 1) drain console commands
+            while True:
+                try:
+                    cmd, arg = cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                if cmd in ("help", "?"):
+                    print(HELP_TEXT)
+
+                elif cmd == "ids":
+                    try:
+                        raw = arg.replace(",", " ").split()
+                        for tok in raw:
+                            mid = int(tok)
+                            if mid not in motors:
+                                motors[mid] = MotorBase(mid)
+                        if raw:
+                            current_id = int(raw[0])
+                        print(f"등록된 모터: {sorted(motors.keys())}, current id = {current_id}")
+                    except Exception:
+                        print("형식: ids 1,2,3")
+
+                elif cmd == "id":
+                    try:
+                        n = int(arg.strip())
+                        if n not in motors:
+                            motors[n] = MotorBase(n)
+                        current_id = n
+                        print(f"current id = {current_id}")
+                    except Exception:
+                        print("형식: id 1")
+
+                elif cmd == "on":
+                    if current_id is None:
+                        print("먼저 id를 선택하세요."); continue
+                    motors[current_id].on(); print(f"[{current_id}] ON")
+
+                elif cmd == "off":
+                    if current_id is None:
+                        print("먼저 id를 선택하세요."); continue
+                    motors[current_id].off(); print(f"[{current_id}] OFF")
+
+                elif cmd == "origin":
+                    if current_id is None:
+                        print("먼저 id를 선택하세요."); continue
+                    motors[current_id].origin(); print(f"[{current_id}] ORIGIN done")
+
+                elif cmd == "update":
+                    if current_id is None:
+                        print("먼저 id를 선택하세요."); continue
+                    kv = parse_update_args(arg)
+                    motors[current_id].update_parameters(
+                        pos=kv.get("pos"), vel=kv.get("vel"),
+                        kp=kv.get("kp"), kd=kv.get("kd"), tor=kv.get("tor"))
+                    print(f"[{current_id}] updated {kv}")
+
+                elif cmd == "get":
+                    target = current_id
+                    if arg.strip():
+                        try: target = int(arg.strip())
+                        except Exception: pass
+                    if target is None:
+                        print("먼저 id를 선택하세요."); continue
+                    st = motors[target].get_parameters()
+                    print(f"[{target}] pos={st.pos:+.4f} rad  vel={st.vel:+.3f} rad/s  "
+                          f"tau={st.tau:+.3f} Nm  iq={st.iq:+.3f} A  T={st.temp:.1f}°C  err={st.err}")
+
+                elif cmd == "show":
+                    states = MotorBase.rx().get_all_states()
+                    if not states:
+                        print("상태 없음")
+                    for mid in sorted(states.keys()):
+                        st = states[mid]
+                        print(f"[{mid}] pos={st.pos:+.4f} rad  vel={st.vel:+.3f} rad/s  "
+                              f"tau={st.tau:+.3f} Nm  iq={st.iq:+.3f} A  T={st.temp:.1f}°C  err={st.err}")
+
+                elif cmd == "start":
+                    label = arg.strip() or "run"
+                    path = MotorBase.rx().start_record(label)
+                    print(f"CSV logging → {path}")
+
+                elif cmd in ("stop", "end"):
+                    MotorBase.rx().stop_record()
+                    print("logging stopped")
+
+                elif cmd == "close":
+                    print("모터 종료 및 종료 중...")
+                    # 안전 종료는 finally에서 보장하므로 여기서는 플래그만
+                    running = False
+
+                else:
+                    print("알 수 없는 명령입니다. 'help'를 입력하세요.")
+
+            if not running:
+                break
+
+            # 2) one control tick (main thread)
+            states = MotorBase._pool.step_once()
+            if states:
+                loop_ms = int((time.monotonic() - t0) * 1000)
+                MotorBase.rx().ingest_states(loop_ms, states)
+
+    except Exception as e:
+        print(f"[ERR] main loop exception: {e}")
+    finally:
+        # ★ 어떤 경우든 안전 종료 보장
+        try:
+            pool = MotorBase._pool
+            if pool:
+                for mid, dev in list(pool.devs.items()):
+                    try: dev.off()
+                    except Exception: pass
+        finally:
+            MotorBase.close_all()
+        print("bye.")
 
 # =============================================================================
-# Entry Point
+# Entry point
 # =============================================================================
 
 if __name__ == "__main__":
+    # SoftRealtimeLoop는 메인 스레드에서만 signal을 사용하므로, 여기서 SIGINT를 캐치해 안전 종료 플래그로
     def _sigint(_sig, _frm):
         print("\n(SIGINT) -> close")
-        raise KeyboardInterrupt()
+        cmd_q.put(("close", ""))   # 콘솔 스레드 유무와 관계없이 종료 지령
     signal.signal(signal.SIGINT, _sigint)
 
-    try:
-        run_console()
-    except KeyboardInterrupt:
-        try:
-            MotorBase.close_all()
-        except Exception:
-            pass
-        print("종료.")
+    run_main_precision()
